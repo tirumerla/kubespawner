@@ -19,7 +19,7 @@ from kubernetes.client.models import (
     V1Toleration,
     V1Affinity,
     V1NodeAffinity, V1NodeSelector, V1NodeSelectorTerm, V1PreferredSchedulingTerm, V1NodeSelectorRequirement,
-    V1PodAffinity, V1PodAntiAffinity, V1WeightedPodAffinityTerm, V1PodAffinityTerm,
+    V1PodAffinity, V1PodAntiAffinity, V1WeightedPodAffinityTerm, V1PodAffinityTerm, V1Secret, V1EnvFromSource, V1SecretEnvSource, 
 )
 
 def make_pod(
@@ -36,7 +36,7 @@ def make_pod(
     supplemental_gids=None,
     run_privileged=False,
     allow_privilege_escalation=True,
-    env=None,
+    env_from=None,
     working_dir=None,
     volumes=None,
     volume_mounts=None,
@@ -286,24 +286,12 @@ def make_pod(
     if all([e is None for e in container_security_context.to_dict().values()]):
         container_security_context = None
 
-    # Transform a dict into valid Kubernetes EnvVar Python representations. This
-    # representation shall always have a "name" field as well as either a
-    # "value" field or "value_from" field. For examples see the
-    # test_make_pod_with_env function.
-    prepared_env = []
-    for k, v in (env or {}).items():
-        if type(v) == dict:
-            if not "name" in v:
-                v["name"] = k
-            prepared_env.append(get_k8s_model(V1EnvVar, v))
-        else:
-            prepared_env.append(V1EnvVar(name=k, value=v))
     notebook_container = V1Container(
         name='notebook',
         image=image,
         working_dir=working_dir,
         ports=[V1ContainerPort(name='notebook-port', container_port=port)],
-        env=prepared_env,
+        env_from=[V1EnvFromSource(secret_ref=V1SecretEnvSource(env_from))],
         args=cmd,
         image_pull_policy=image_pull_policy,
         lifecycle=lifecycle_hooks,
@@ -482,6 +470,36 @@ def make_pvc(
         pvc.spec.selector = selector
 
     return pvc
+
+def make_secret(
+    name,
+    str_data,
+    labels=None,
+    annotations=None,
+):
+    """
+    Make a k8s secret for all env. variables.
+    https://github.com/kubernetes-client/python/blob/master/kubernetes/client/models/v1_secret.py
+
+    Parameters
+    ----------
+    name:
+        Name of the secret. Must be unique within the namespace the object is
+        going to be created in.
+    string_data:
+        Data to be encrypted. 
+    """
+
+    secret = V1Secret()
+    secret.kind = "Secret"
+    secret.api_version = "v1"
+    secret.metadata = V1ObjectMeta()
+    secret.metadata.name = name
+    secret.metadata.annotations = (annotations or {}).copy()
+    secret.metadata.labels = (labels or {}).copy()
+    secret.string_data = str_data
+
+    return secret
 
 def make_ingress(
         name,

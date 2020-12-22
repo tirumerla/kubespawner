@@ -41,7 +41,7 @@ from jinja2 import Environment, BaseLoader
 
 from .clients import shared_client
 from kubespawner.traitlets import Callable
-from kubespawner.objects import make_pod, make_pvc
+from kubespawner.objects import make_pod, make_pvc, make_secret
 from kubespawner.reflector import NamespacedResourceReflector
 from slugify import slugify
 
@@ -185,6 +185,7 @@ class KubeSpawner(Spawner):
 
         # runs during both test and normal execution
         self.pod_name = self._expand_user_properties(self.pod_name_template)
+        self.secret_name = self._expand_user_properties(self.secret_name_template)
         self.pvc_name = self._expand_user_properties(self.pvc_name_template)
         if self.working_dir:
             self.working_dir = self._expand_user_properties(self.working_dir)
@@ -329,6 +330,29 @@ class KubeSpawner(Spawner):
         WARNING: Be careful with this configuration! Make sure the service account being mounted
         has the minimal permissions needed, and nothing more. When misconfigured, this can easily
         give arbitrary users root over your entire cluster.
+        """
+    )
+
+    secret_name_template = Unicode(
+        'secret-{username}--{servername}',
+        config=True,
+        help="""
+        Template to use to form the secret name corresponding to user's pods.
+
+        `{username}` is expanded to the escaped, dns-label-safe username.
+        `{servername}` is expanded to the escaped, dns-label-safe server name, if any.
+
+        Trailing `-` characters are stripped for safe handling of empty server names (user default servers).
+
+        This must be unique within the namespace the pods are being spawned
+        in, so if you are running multiple jupyterhubs spawning in the
+        same namespace, consider setting this to be something more unique.
+
+        .. versionchanged:: 0.12
+            `--` delimiter added to the template,
+            where it was implicitly added to the `servername` field before.
+            Additionally, `username--servername` delimiter was `-` instead of `--`,
+            allowing collisions in certain circumstances.
         """
     )
 
@@ -1496,7 +1520,7 @@ class KubeSpawner(Spawner):
             supplemental_gids=supplemental_gids,
             run_privileged=self.privileged,
             allow_privilege_escalation=self.allow_privilege_escalation,
-            env=self.get_env(),
+            env_from=self.secret_name,
             volumes=self._expand_all(self.volumes),
             volume_mounts=self._expand_all(self.volume_mounts),
             working_dir=self.working_dir,
@@ -1543,6 +1567,24 @@ class KubeSpawner(Spawner):
             access_modes=self.storage_access_modes,
             selector=self.storage_selector,
             storage=self.storage_capacity,
+            labels=labels,
+            annotations=annotations
+        )
+    
+    def get_secret_manifest(self):
+        """
+        Make a secret manifest that will spawn current user's env. variables into a secret.
+        """
+        labels = self._build_common_labels({})
+        labels.update({
+            'component': 'singleuser-secret'
+        })
+
+        annotations = self._build_common_annotations({})
+
+        return make_secret(
+            name=self.secret_name,
+            str_data=self.get_env(),
             labels=labels,
             annotations=annotations
         )
@@ -1880,6 +1922,56 @@ class KubeSpawner(Spawner):
             else:
                 raise
 
+    async def _make_create_secret_request(self, secret, request_timeout):
+        # Try and create the secret. If it succeeds we are good. If
+        # returns a 409 indicating it already exists we are good. If
+        # it returns a 403, indicating potential quota issue we need
+        # to see if secret already exists before we decide to raise the
+        # error for quota being exceeded. This is because quota is
+        # checked before determining if the Secret needed to be
+        # created.
+        secret_name = secret.metadata.name
+        try:
+            self.log.info(f"Attempting to create secret {secret.metadata.name}, with timeout {request_timeout}")
+            await gen.with_timeout(timedelta(seconds=request_timeout), self.asynchronize(
+                self.api.create_namespaced_secret,
+                namespace=self.namespace,
+                body=secret
+            ))
+            return True
+        except gen.TimeoutError:
+            # Just try again
+            return False
+        except ApiException as e:
+            if e.status == 409:
+                # Replace if it already exists with new values
+                self.log.info("Secret " + secret_name + " already exists, replacing with new values.")
+                try:
+                    await self.asynchronize(
+                        self.api.replace_namespaced_secret,
+                        name=secret_name,
+                        namespace=self.namespace,
+                        body=secret)
+                except ApiException as e:
+                    raise
+                return True
+            elif e.status == 403:
+                t, v, tb = sys.exc_info()
+
+                try:
+                    await self.asynchronize(
+                        self.api.read_namespaced_secret,
+                        name=secret_name,
+                        namespace=self.namespace)
+
+                except ApiException as e:
+                    raise v.with_traceback(tb)
+
+                self.log.info("Secret " + secret_name + " already exists, possibly have reached quota though.")
+                return True
+            else:
+                raise
+
     async def _start(self):
         """Start the user's pod"""
 
@@ -1905,6 +1997,16 @@ class KubeSpawner(Spawner):
                 # Each req should be given k8s_api_request_timeout seconds.
                 timeout=self.k8s_api_request_retry_timeout
             )
+
+        secret = self.get_secret_manifest()
+        # If there's a timeout, just let it propagate
+        await exponential_backoff(
+            partial(self._make_create_secret_request, secret, self.k8s_api_request_timeout),
+            f'Could not create secret {self.secret_name}',
+            # Each req should be given k8s_api_request_timeout seconds.
+            timeout=self.k8s_api_request_retry_timeout
+        )
+
         # If we run into a 409 Conflict error, it means a pod with the
         # same name already exists. We stop it, wait for it to stop, and
         # try again. We try 4 times, and if it still fails we give up.
@@ -1956,6 +2058,36 @@ class KubeSpawner(Spawner):
                 ),
             )
         return (pod["status"]["podIP"], self.port)
+    
+    async def _make_delete_secret_request(self, secret_name, delete_options, grace_seconds, request_timeout):
+        """
+        Make an HTTP request to delete the given secret
+
+        Designed to be used with exponential_backoff, so returns
+        True / False on success / failure
+        """
+        self.log.info("Deleting Secret %s", secret_name)
+        try:
+            await gen.with_timeout(timedelta(seconds=request_timeout), self.asynchronize(
+                self.api.delete_namespaced_secret,
+                name=secret_name,
+                namespace=self.namespace,
+                body=delete_options,
+                grace_period_seconds=grace_seconds,
+            ))
+            return True
+        except gen.TimeoutError:
+            return False
+        except ApiException as e:
+            if e.status == 404:
+                self.log.warning(
+                    "No secret %s to delete. Assuming already deleted.",
+                    secret_name,
+                )
+                # If there isn't already a secret, that's ok too!
+                return True
+            else:
+                raise
 
     async def _make_delete_pod_request(self, pod_name, delete_options, grace_seconds, request_timeout):
         """
@@ -1996,7 +2128,12 @@ class KubeSpawner(Spawner):
             grace_seconds = self.delete_grace_period
 
         delete_options.grace_period_seconds = grace_seconds
-
+        
+        await exponential_backoff(
+            partial(self._make_delete_secret_request, self.secret_name, delete_options, grace_seconds, self.k8s_api_request_timeout),
+            f'Could not delete secret {self.secret_name}',
+            timeout=self.k8s_api_request_retry_timeout
+        )
 
         await exponential_backoff(
             partial(self._make_delete_pod_request, self.pod_name, delete_options, grace_seconds, self.k8s_api_request_timeout),

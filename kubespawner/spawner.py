@@ -7,6 +7,7 @@ implementation that should be used by JupyterHub.
 import asyncio
 import multiprocessing
 import os
+import base64
 import string
 import sys
 import warnings
@@ -24,6 +25,7 @@ from jupyterhub.traitlets import Command
 from jupyterhub.utils import exponential_backoff
 from kubernetes import client
 from kubernetes.client.rest import ApiException
+from kubernetes.client.models import V1EnvVar
 from slugify import slugify
 from tornado import gen
 from tornado.concurrent import run_on_executor
@@ -38,6 +40,7 @@ from traitlets import Unicode
 from traitlets import Union
 from traitlets import validate
 
+from .utils import get_k8s_model
 from .clients import shared_client
 from .objects import make_namespace
 from .objects import make_owner_reference
@@ -1880,7 +1883,8 @@ class KubeSpawner(Spawner):
             allow_privilege_escalation=self.allow_privilege_escalation,
             container_security_context=csc,
             pod_security_context=psc,
-            env=self.get_env(),
+            env=self.get_env_value_from() if self.get_env_value_from() else None,
+            env_from=self.secret_name,
             volumes=self._expand_all(self.volumes),
             volume_mounts=self._expand_all(self.volume_mounts),
             working_dir=self.working_dir,
@@ -1925,9 +1929,7 @@ class KubeSpawner(Spawner):
 
         return make_secret(
             name=self.secret_name,
-            username=self.user.name,
-            cert_paths=self.cert_paths,
-            hub_ca=self.internal_trust_bundles['hub-ca'],
+            string_data=self.get_env(),
             owner_references=[owner_reference],
             labels=labels,
             annotations=annotations,
@@ -2023,11 +2025,54 @@ class KubeSpawner(Spawner):
         """
 
         env = super(KubeSpawner, self).get_env()
+        # Filter env. variables with only values and pass it to secret
+        env = {k: v for k, v in (env or {}).items() if type(v) != dict}
+
         # deprecate image
         env['JUPYTER_IMAGE_SPEC'] = self.image
         env['JUPYTER_IMAGE'] = self.image
 
+        if self.internal_ssl:
+            """
+            cert_paths:
+                certificate path references
+            hub_ca:
+                Path to the hub certificate authority
+            """
+            with open(self.cert_paths['keyfile'], 'r') as file:
+                env['ssl.key'] = file.read()
+
+            with open(self.cert_paths['certfile'], 'r') as file:
+                env['ssl.crt'] = file.read()
+
+            with open(self.cert_paths['cafile'], 'r') as file:
+                env["notebooks-ca_trust.crt"] = file.read()
+
+            with open(self.internal_trust_bundles['hub-ca'], 'r') as file:
+                env["notebooks-ca_trust.crt"] = env[
+                    "notebooks-ca_trust.crt"
+                ] + file.read()
+            env['JUPYTERHUB_SSL_KEYFILE'] = self.secret_mount_path + "ssl.key"
+            env['JUPYTERHUB_SSL_CERTFILE'] = self.secret_mount_path + "ssl.crt"
+            env['JUPYTERHUB_SSL_CLIENT_CA'] = (self.secret_mount_path + "notebooks-ca_trust.crt")
+
         return env
+    
+    def get_env_value_from(self):
+        """Return the environment dict to use for the Spawner.
+        See also: jupyterhub.Spawner.get_env
+        """
+
+        env = super(KubeSpawner, self).get_env()
+        env_value_from = []
+        # Filter env. variables with only "valueFrom" environment variables.
+        extra_env = {k: v for k, v in (env or {}).items() if type(v) == dict}
+        for k, v in (extra_env or {}).items():
+            if not "name" in v:
+                v["name"] = k
+            env_value_from.append(get_k8s_model(V1EnvVar, v))
+
+        return env_value_from
 
     def load_state(self, state):
         """
@@ -2511,36 +2556,37 @@ class KubeSpawner(Spawner):
             timeout=self.k8s_api_request_retry_timeout,
         )
 
-        if self.internal_ssl:
-            try:
-                # wait for pod to have uid,
-                # required for creating owner reference
-                await exponential_backoff(
-                    lambda: self.pod_has_uid(
-                        self.pod_reflector.pods.get(ref_key, None)
-                    ),
-                    f"pod/{ref_key} does not have a uid!",
-                )
+        try:
+            # wait for pod to have uid,
+            # required for creating owner reference
+            await exponential_backoff(
+                lambda: self.pod_has_uid(
+                    self.pod_reflector.pods.get(ref_key, None)
+                ),
+                f"pod/{ref_key} does not have a uid!",
+            )
 
-                pod = self.pod_reflector.pods[ref_key]
-                owner_reference = make_owner_reference(
-                    self.pod_name, pod["metadata"]["uid"]
-                )
+            pod = self.pod_reflector.pods[ref_key]
+            owner_reference = make_owner_reference(
+                self.pod_name, pod["metadata"]["uid"]
+            )
 
-                # internal ssl, create secret object
-                secret_manifest = self.get_secret_manifest(owner_reference)
-                await exponential_backoff(
-                    partial(
-                        self._ensure_not_exists, "secret", secret_manifest.metadata.name
-                    ),
-                    f"Failed to delete secret {secret_manifest.metadata.name}",
-                )
-                await exponential_backoff(
-                    partial(
-                        self._make_create_resource_request, "secret", secret_manifest
-                    ),
-                    f"Failed to create secret {secret_manifest.metadata.name}",
-                )
+            # internal ssl, create secret object
+            secret_manifest = self.get_secret_manifest(owner_reference)
+            await exponential_backoff(
+                partial(
+                    self._ensure_not_exists, "secret", secret_manifest.metadata.name
+                ),
+                f"Failed to delete secret {secret_manifest.metadata.name}",
+            )
+            await exponential_backoff(
+                partial(
+                    self._make_create_resource_request, "secret", secret_manifest
+                ),
+                f"Failed to create secret {secret_manifest.metadata.name}",
+            )
+
+            if self.internal_ssl:
 
                 service_manifest = self.get_service_manifest(owner_reference)
                 await exponential_backoff(
@@ -2557,10 +2603,10 @@ class KubeSpawner(Spawner):
                     ),
                     f"Failed to create service {service_manifest.metadata.name}",
                 )
-            except Exception:
-                # cleanup on failure and re-raise
-                await self.stop(True)
-                raise
+        except Exception:
+            # cleanup on failure and re-raise
+            await self.stop(True)
+            raise
 
         # we need a timeout here even though start itself has a timeout
         # in order for this coroutine to finish at some point.

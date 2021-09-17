@@ -17,6 +17,8 @@ from kubernetes.client.models import V1EndpointPort
 from kubernetes.client.models import V1Endpoints
 from kubernetes.client.models import V1EndpointSubset
 from kubernetes.client.models import V1EnvVar
+from kubernetes.client.models import V1EnvFromSource 
+from kubernetes.client.models import V1SecretEnvSource
 from kubernetes.client.models import V1LabelSelector
 from kubernetes.client.models import V1Lifecycle
 from kubernetes.client.models import V1LocalObjectReference
@@ -68,6 +70,7 @@ def make_pod(
     container_security_context=None,
     pod_security_context=None,
     env=None,
+    env_from=None,
     working_dir=None,
     volumes=None,
     volume_mounts=None,
@@ -344,11 +347,6 @@ def make_pod(
             }
         )
 
-        env['JUPYTERHUB_SSL_KEYFILE'] = ssl_secret_mount_path + "ssl.key"
-        env['JUPYTERHUB_SSL_CERTFILE'] = ssl_secret_mount_path + "ssl.crt"
-        env['JUPYTERHUB_SSL_CLIENT_CA'] = (
-            ssl_secret_mount_path + "notebooks-ca_trust.crt"
-        )
 
         if not volume_mounts:
             volume_mounts = []
@@ -509,6 +507,7 @@ def make_pod(
         working_dir=working_dir,
         ports=[V1ContainerPort(name='notebook-port', container_port=port)],
         env=sorted_env,
+        env_from=[V1EnvFromSource(secret_ref=V1SecretEnvSource(env_from))],
         args=cmd,
         image_pull_policy=image_pull_policy,
         lifecycle=lifecycle_hooks,
@@ -854,9 +853,7 @@ def make_owner_reference(name, uid):
 
 def make_secret(
     name,
-    username,
-    cert_paths,
-    hub_ca,
+    string_data,
     owner_references,
     labels=None,
     annotations=None,
@@ -869,12 +866,10 @@ def make_secret(
     name:
         Name of the secret. Must be unique within the namespace the object is
         going to be created in.
+    string_data:
+        Data to be encrypted. 
     username:
         The name of the user notebook.
-    cert_paths:
-        JupyterHub spawners cert_paths dictionary container certificate path references
-    hub_ca:
-        Path to the hub certificate authority
     labels:
         Labels to add to the secret.
     annotations:
@@ -888,27 +883,8 @@ def make_secret(
     secret.metadata.name = name
     secret.metadata.annotations = (annotations or {}).copy()
     secret.metadata.labels = (labels or {}).copy()
+    secret.string_data = string_data
     secret.metadata.owner_references = owner_references
-
-    secret.data = {}
-
-    with open(cert_paths['keyfile'], 'r') as file:
-        encoded = base64.b64encode(file.read().encode("utf-8"))
-        secret.data['ssl.key'] = encoded.decode("utf-8")
-
-    with open(cert_paths['certfile'], 'r') as file:
-        encoded = base64.b64encode(file.read().encode("utf-8"))
-        secret.data['ssl.crt'] = encoded.decode("utf-8")
-
-    with open(cert_paths['cafile'], 'r') as file:
-        encoded = base64.b64encode(file.read().encode("utf-8"))
-        secret.data["notebooks-ca_trust.crt"] = encoded.decode("utf-8")
-
-    with open(hub_ca, 'r') as file:
-        encoded = base64.b64encode(file.read().encode("utf-8"))
-        secret.data["notebooks-ca_trust.crt"] = secret.data[
-            "notebooks-ca_trust.crt"
-        ] + encoded.decode("utf-8")
 
     return secret
 
